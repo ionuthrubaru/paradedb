@@ -19,6 +19,7 @@
 //!
 //! Every immutable segment carries two facts about each fast field: the empirical `min` and
 //! `max` of the values it holds, and, after a partitioned build, the box the build assigned it.
+//! Vector partitions also carry their coarse centroid for global routing.
 //! A missing file or entry means "unknown", and a consumer must keep the segment.
 //!
 //! `plugin` writes and merges the file, `pruning` reads it for range partitioning. The types
@@ -36,6 +37,7 @@ use tantivy::directory::{CompositeFile, FileSlice};
 use tantivy::index::{Segment, SegmentReader};
 use tantivy::schema::{Field, FieldType};
 
+use crate::api::CTID_FIELD_NAME;
 use crate::postgres::datetime::PostgresDateTime;
 use crate::postgres::pdb_owned_value::{PdbOwnedValue, exact_scalar_wire};
 use crate::postgres::storage::block::STATS_EXT;
@@ -55,6 +57,14 @@ pub(crate) use pruning::{
 
 const EMPIRICAL_IDX: usize = 0;
 const LOGICAL_IDX: usize = 1;
+const VECTOR_PARTITION_IDX: usize = 2;
+
+/// The build's coarse centroid, used for global vector routing.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VectorPartition<T> {
+    pub(crate) field: String,
+    pub(crate) centroid: Vec<T>,
+}
 
 /// Empirical `min`/`max` of one fast field within one segment. `nullable` is false only when
 /// every document holds exactly one value, so a segment without it may hide NULLs.
@@ -81,13 +91,15 @@ pub(crate) fn partition_box(
     partition: usize,
 ) -> Option<std::sync::Arc<LogicalBoundsByField>> {
     let bounds = tree.partition_bounds(partition)?;
-    Some(std::sync::Arc::new(
-        tree.dims()
-            .iter()
-            .zip(bounds)
-            .map(|(dim, (lower, upper))| (dim.as_ref().to_string(), LogicalBounds { lower, upper }))
-            .collect(),
-    ))
+    let dim_names = tree.dims().iter().map(|f| f.to_string());
+    let mut bounds_by_field: LogicalBoundsByField = dim_names
+        .zip(bounds.dims)
+        .map(|(dim, (lower, upper))| (dim, LogicalBounds { lower, upper }))
+        .collect();
+    if let Some((lower, upper)) = bounds.ctid_fallback {
+        bounds_by_field.insert(CTID_FIELD_NAME.to_string(), LogicalBounds { lower, upper });
+    }
+    Some(std::sync::Arc::new(bounds_by_field))
 }
 
 /// The default `PdbOwnedValue` serde is lossy (a non-negative `I64` comes back as `U64`), so the
@@ -505,6 +517,10 @@ impl SegmentStats {
         Ok(self
             .read::<LogicalWire>(field, LOGICAL_IDX)?
             .map(LogicalBounds::from))
+    }
+
+    pub(crate) fn vector_partition(&self, field: Field) -> io::Result<Option<Vec<f32>>> {
+        self.read(field, VECTOR_PARTITION_IDX)
     }
 
     fn read<T: DeserializeOwned>(&self, field: Field, idx: usize) -> io::Result<Option<T>> {
