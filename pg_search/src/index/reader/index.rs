@@ -75,6 +75,31 @@ use tantivy::{
 /// `SearchIndexReader::search_top_k_in_segments`.
 pub const MAX_TOPK_FEATURES: usize = 5;
 
+#[cold]
+#[track_caller]
+fn report_segment_collection_error(error: tantivy::TantivyError) -> ! {
+    // Tantivy exposes this failure as a string, not a distinct error variant.
+    // Keep its quoted field name and leave unrelated collection errors intact.
+    if let tantivy::TantivyError::InvalidArgument(message) = &error
+        && let Some(field) = message
+            .strip_prefix("Field ")
+            .and_then(|message| message.strip_suffix(" is not configured as fast field"))
+    {
+        pgrx::pg_sys::panic::ErrorReport::new(
+            pgrx::PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+            format!("field {field} requires columnar storage"),
+            pgrx::function_name!(),
+        )
+        .set_hint(
+            "Recreate the index with 'columnar=true' on the field's tokenizer, or use \
+             pdb.literal or pdb.literal_normalized, which enable columnar storage by default. \
+             For a JSON path, configure its parent JSON field.",
+        )
+        .report(pgrx::PgLogLevel::ERROR);
+    }
+    panic!("should be able to collect in segment: {error:?}");
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DocsEstimate {
     pub matching_docs: usize,
@@ -3226,7 +3251,7 @@ impl SearchIndexReader {
             .map(|(segment_ord, segment_reader)| {
                 let fruit = collector
                     .collect_segment(weight, segment_ord, segment_reader)
-                    .expect("should be able to collect in segment");
+                    .unwrap_or_else(|error| report_segment_collection_error(error));
                 if let Some(stats) = &self.directory.io_stats {
                     stats.end_segment(segment_reader.segment_id());
                 }
@@ -3265,7 +3290,7 @@ impl SearchIndexReader {
                 };
                 let fruit = collector
                     .collect_segment(weight, segment_ord, segment_reader)
-                    .expect("should be able to collect in segment");
+                    .unwrap_or_else(|error| report_segment_collection_error(error));
                 if let Some(stats) = &self.directory.io_stats {
                     stats.end_segment(segment_reader.segment_id());
                 }

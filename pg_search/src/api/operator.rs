@@ -906,6 +906,22 @@ pub unsafe fn tantivy_field_name_from_node(
     if field_name.is_none() {
         let var = nodecast!(Var, T_Var, node)?;
         if (*var).varattno != 0 {
+            if let Some(field_var) = nodecast!(Var, T_Var, field_node)
+                && let Some(column) = attname_from_var(&heaprel, field_var)
+            {
+                ErrorReport::new(
+                    PgSqlErrorCode::ERRCODE_UNDEFINED_COLUMN,
+                    format!(
+                        "column \"{column}\" is not included in ParadeDB index \"{}\"",
+                        indexrel.name()
+                    ),
+                    function_name!(),
+                )
+                .set_hint(format!(
+                    "Recreate the index including column \"{column}\" to search it with a ParadeDB operator."
+                ))
+                .report(PgLogLevel::ERROR);
+            }
             return None;
         }
     }
